@@ -1,6 +1,6 @@
-import c4.policyengine.policyEngine
+from c4.policyengine import BinaryOperator
 
-class Equal(c4.policyengine.policyEngine.BinaryOperator):
+class Equal(BinaryOperator):
 
     id = "=="
 
@@ -9,7 +9,7 @@ class Equal(c4.policyengine.policyEngine.BinaryOperator):
             return one is two
         return False
 
-class GreaterThan(c4.policyengine.policyEngine.BinaryOperator):
+class GreaterThan(BinaryOperator):
 
     id = ">"
 
@@ -28,7 +28,7 @@ class GreaterThanOrEqual(GreaterThan, Equal):
             return True
         return False
 
-class LessThan(c4.policyengine.policyEngine.BinaryOperator):
+class LessThan(BinaryOperator):
 
     id = "<"
 

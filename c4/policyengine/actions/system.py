@@ -2,7 +2,7 @@ import json
 
 from c4.messaging import sendMessage
 from c4.system.db import DBManager
-from c4.policyengine.policyEngine import Action
+from c4.policyengine import Action
 from c4.utils.logutil import ClassLogger
 
 @ClassLogger

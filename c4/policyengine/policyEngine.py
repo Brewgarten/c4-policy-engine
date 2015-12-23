@@ -809,8 +809,8 @@ class PolicyEngine(object):
         """
         Loads Actions from the c4/system/policies directory.
         """
-        actions = c4.utils.util.getModuleClasses(c4.policyengine.actions, c4.policyengine.policyEngine.Action)
-        actions.extend(c4.utils.util.getModuleClasses(c4.policyengine.policies, c4.policyengine.policyEngine.Action))
+        actions = c4.utils.util.getModuleClasses(c4.policyengine.actions, Action)
+        actions.extend(c4.utils.util.getModuleClasses(c4.policyengine.policies, Action))
         # filter out base classes
         actions = [action for action in actions if action != Action and action != ActionReference]
         self.addActions(actions)
@@ -820,9 +820,9 @@ class PolicyEngine(object):
         Loads Policies from the c4/system/policies directory.
         """
         # load policies
-        policies = c4.utils.util.getModuleClasses(c4.policyengine.policies, c4.policyengine.policyEngine.Policy)
+        policies = c4.utils.util.getModuleClasses(c4.policyengine.policies, Policy)
         # filter out base class
-        policies = [policy for policy in policies if policy != c4.policyengine.policyEngine.Policy]
+        policies = [policy for policy in policies if policy != Policy]
         for policy in policies:
             try:
                 self.log.debug("loading default policy '%s' of type '%s.%s'", policy.id, policy.__module__, policy.__name__)
@@ -831,10 +831,10 @@ class PolicyEngine(object):
                 self.log.error(e)
                 self.log.error(traceback.format_exc())
 
-        wrappedPolicies = c4.utils.util.getModuleClasses(c4.policyengine.policies, c4.policyengine.policyEngine.PolicyWrapper)
+        wrappedPolicies = c4.utils.util.getModuleClasses(c4.policyengine.policies, PolicyWrapper)
         # remove base class
-        if c4.policyengine.policyEngine.PolicyWrapper in wrappedPolicies:
-            wrappedPolicies.remove(c4.policyengine.policyEngine.PolicyWrapper)
+        if PolicyWrapper in wrappedPolicies:
+            wrappedPolicies.remove(PolicyWrapper)
         for wrappedPolicy in wrappedPolicies:
             self.log.debug("loading default policy '%s' '%s'", wrappedPolicy.id, wrappedPolicy.policy)
             self.loadPolicy(wrappedPolicy.id + ":" + wrappedPolicy.policy)
@@ -843,8 +843,8 @@ class PolicyEngine(object):
         """
         Loads Events from the c4/system/policies directory.
         """
-        events = c4.utils.util.getModuleClasses(c4.policyengine.events, c4.policyengine.policyEngine.Event)
-        events.extend(c4.utils.util.getModuleClasses(c4.policyengine.policies, c4.policyengine.policyEngine.Event))
+        events = c4.utils.util.getModuleClasses(c4.policyengine.events, Event)
+        events.extend(c4.utils.util.getModuleClasses(c4.policyengine.policies, Event))
         # filter out base classes and operators
         events = [event for event in events if event != Event and not issubclass(event, (UnaryOperator, BinaryOperator))]
         self.addEvents(events)

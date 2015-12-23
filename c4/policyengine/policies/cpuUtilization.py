@@ -1,7 +1,7 @@
 import json
 
 from c4.system.db import DBManager
-from c4.policyengine.policyEngine import Event, PolicyWrapper
+from c4.policyengine import Event, PolicyWrapper
 from c4.system.configuration import Configuration
 
 class CpuUtilization(Event):

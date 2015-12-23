@@ -19,7 +19,7 @@ from c4.messaging import sendMessage
 from c4.system.configuration import Configuration, Roles, States
 from c4.system.db import DBManager
 from c4.system.messages import Status
-from c4.policyengine.policyEngine import Action, Event, Policy
+from c4.policyengine import Action, Event, Policy
 from c4.utils.logutil import ClassLogger
 
 log = logging.getLogger(__name__)

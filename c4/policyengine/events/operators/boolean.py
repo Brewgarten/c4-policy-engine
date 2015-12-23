@@ -1,6 +1,6 @@
-import c4.policyengine.policyEngine
+from c4.policyengine import BinaryOperator, UnaryOperator
 
-class And(c4.policyengine.policyEngine.BinaryOperator):
+class And(BinaryOperator):
 
     id = "and"
 
@@ -9,7 +9,7 @@ class And(c4.policyengine.policyEngine.BinaryOperator):
             return one and two
         return False
 
-class Not(c4.policyengine.policyEngine.UnaryOperator):
+class Not(UnaryOperator):
 
     id = "not"
 
@@ -18,7 +18,7 @@ class Not(c4.policyengine.policyEngine.UnaryOperator):
             return not one
         return False
 
-class Or(c4.policyengine.policyEngine.BinaryOperator):
+class Or(BinaryOperator):
 
     id = "or"
 
