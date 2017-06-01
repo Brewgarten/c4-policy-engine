@@ -11,16 +11,17 @@ Examples
 Functionality
 -------------
 """
+import datetime
 import logging
 
-from datetime import datetime
-
-from c4.messaging import sendMessage
-from c4.system.configuration import Configuration, Roles, States
-from c4.system.db import DBManager
-from c4.system.messages import Status
+from c4.messaging import RouterClient
 from c4.policyengine import Action, Event, Policy
+from c4.system.backend import Backend
+from c4.system.configuration import Roles, States
+from c4.system.messages import Status
 from c4.utils.logutil import ClassLogger
+
+
 
 log = logging.getLogger(__name__)
 
@@ -40,23 +41,17 @@ class StatusAgeInSeconds(Event):
         :param fullDeviceName: fully qualified device manager name
         :type fullDeviceName: device
         """
-        # TODO: this kind of query should be in a separate History class
-        database = DBManager()
-        rows = database.query("""
-            select history_date
-            from t_sm_history
-            where node = ? and name is ?
-            order by history_date desc
-            limit 1""",
-            (node, fullDeviceName,))
-        database.close()
-        if rows:
-            history_date = rows[0][0]
-            timestamp = datetime.strptime(history_date, "%Y-%m-%d %H:%M:%S.%f")
-            now = datetime.utcnow()
-            timeDifference = now - timestamp
-            return (timeDifference.days * 3600 * 24) + timeDifference.seconds
-        return -1
+        if fullDeviceName:
+            status = Backend().deviceHistory.getLatest(node, fullDeviceName)
+        else:
+            status = Backend().nodeHistory.getLatest(node)
+
+        if status is None:
+            return -1
+
+        now = datetime.datetime.utcnow()
+        timeDifference = now - status.timestamp
+        return (timeDifference.days * 3600 * 24) + timeDifference.seconds
 
 @ClassLogger
 class RequestStatus(Action):
@@ -74,17 +69,15 @@ class RequestStatus(Action):
         :param fullDeviceName: fully qualified device manager name
         :type fullDeviceName: device
         """
-        configuration = Configuration()
-        systemManagerNode = configuration.getSystemManagerNodeName()
-        systemManagerAddress = configuration.getAddress(systemManagerNode)
+        client = RouterClient("localhost")
 
         # FIXME: need to convert fullDeviceName . to / for routing
         if fullDeviceName:
             self.log.debug("sending status request to %s/%s", node, fullDeviceName)
-            sendMessage(systemManagerAddress, Status("{0}/{1}".format(node, fullDeviceName)))
+            client.forwardMessage(Status("{0}/{1}".format(node, fullDeviceName)))
         else:
             self.log.debug("sending status request to %s", node)
-            sendMessage(systemManagerAddress, Status(node))
+            client.forwardMessage(Status(node))
 
         return True
 
@@ -95,23 +88,20 @@ class DeviceManagerStatusRefreshPolicy(Policy):
     according to their specified status interval
 
     :param cache: cache
-    :type cache: :class:`~c4.policyengine.policyEngine.Cache`
+    :type cache: :class:`~c4.policyengine.Cache`
     """
     id = "device.status.refresh"
 
     def __init__(self, cache):
         super(DeviceManagerStatusRefreshPolicy, self).__init__(cache)
         self.requestDeviceMap = {}
-        self.statusInterval = {
-            "c4.system.devices.cpu.Cpu": 10000,
-            "c4.system.devices.disk.Disk": 5000,
-        }
 
     def evaluateEvent(self):
         """
         Check status age for all running device managers
         """
-        configuration = Configuration()
+        configuration = Backend().configuration
+        policySettings = configuration.getPlatform().settings.get("policies", {}).get(self.id, {})
 
         statusAgeInSeconds = StatusAgeInSeconds()
 
@@ -128,7 +118,8 @@ class DeviceManagerStatusRefreshPolicy(Policy):
                 for fullDeviceName, deviceInfo in nodeInfo.devices.items():
 
                     age = statusAgeInSeconds.evaluate(node, fullDeviceName)
-                    statusInterval = self.statusInterval.get(deviceInfo.type, 5000) / 1000
+                    # note that all the intervals are specified in seconds
+                    statusInterval = policySettings.get(deviceInfo.type, 10)
 
                     if age < 0 or age >= statusInterval:
                         self.log.debug("%s/%s: age %ss >= %ss", node, fullDeviceName, age, statusInterval)
@@ -156,24 +147,26 @@ class SystemManagerStatusRefreshPolicy(Policy):
     according to their specified status interval
 
     :param cache: cache
-    :type cache: :class:`~c4.policyengine.policyEngine.Cache`
+    :type cache: :class:`~c4.policyengine.Cache`
     """
     id = "node.status.refresh"
 
     def __init__(self, cache):
         super(SystemManagerStatusRefreshPolicy, self).__init__(cache)
         self.requestNodes = set()
-        self.statusInterval = {
-            Roles.ACTIVE : 5000,
-            Roles.PASSIVE : 5000,
-            Roles.THIN: 10000,
-        }
 
     def evaluateEvent(self):
         """
         Check status age for all running system managers
         """
-        configuration = Configuration()
+        configuration = Backend().configuration
+        policySettings = configuration.getPlatform().settings.get("policies", {}).get(self.id, {})
+        # note that all the intervals are specified in seconds
+        statusIntervalParameters = {
+            Roles.ACTIVE: policySettings.get("interval.active", 5),
+            Roles.PASSIVE: policySettings.get("interval.passive", 5),
+            Roles.THIN: policySettings.get("interval.thin", 10),
+        }
 
         statusAgeInSeconds = StatusAgeInSeconds()
 
@@ -186,7 +179,8 @@ class SystemManagerStatusRefreshPolicy(Policy):
             if nodeInfo.state == States.RUNNING:
 
                 age = statusAgeInSeconds.evaluate(node)
-                statusInterval = self.statusInterval.get(nodeInfo.role, 5000) / 1000
+                # note that all the intervals are specified in seconds
+                statusInterval = statusIntervalParameters.get(nodeInfo.role, 10)
 
                 if age < 0 or age >= statusInterval:
                     self.log.debug("%s: age %ss >= %ss", node, age, statusInterval)

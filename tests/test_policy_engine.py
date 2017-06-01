@@ -1,19 +1,21 @@
 import logging
-import pytest
 import random
 import sys
 
 from pyparsing import ParseException, ParseFatalException
+import pytest
 
-from c4.system.configuration import States
-from c4.policyengine import Action, ActionReference, Event, PolicyEngine, PolicyComponent
+from c4.policyengine import (Action, ActionReference,
+                             Event,
+                             Policy, PolicyComponent, PolicyDatabase, PolicyEngine)
 from c4.policyengine.events.operators.boolean import And, Not, Or
 from c4.policyengine.events.operators.comparison import Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual
+from c4.system.configuration import States, NodeInfo, Roles
 from c4.utils.util import getModuleClasses, getFullModuleName
+
 
 log = logging.getLogger(__name__)
 logging.basicConfig(format='%(asctime)s [%(levelname)s] <%(processName)s> [%(name)s(%(filename)s:%(lineno)d)] - %(message)s', level=logging.DEBUG)
-logging.getLogger("c4.system.db").setLevel(logging.INFO)
 logging.getLogger("c4.policyengine").setLevel(logging.INFO)
 logging.getLogger("c4.policyengine.PolicyEngine").setLevel(logging.INFO)
 
@@ -39,6 +41,15 @@ def testEventsAndActions():
         setattr(c4.policyengine.actions, actionClass.__name__, actionClass)
 
 pytestmark = pytest.mark.usefixtures("testEventsAndActions")
+
+@pytest.fixture
+def policyEngine(backend):
+
+    configuration = backend.configuration
+    configuration.addNode(NodeInfo("node1", "tcp://1.2.3.4:5000", role=Roles.ACTIVE))
+    configuration.addAlias("system-manager", "node1")
+
+    return PolicyEngine()
 
 class Alert(Action):
 
@@ -115,6 +126,24 @@ class Utilization(Event):
     def evaluate(self):
         return 0.75
 
+class LowUtilization(Policy):
+
+    id = "test.utilization.low"
+
+    def evaluateEvent(self):
+        return False
+
+    def performActions(self):
+        pass
+
+class HighUtilization(PolicyComponent):
+
+    def __init__(self):
+        super(HighUtilization, self).__init__(
+            "test.utilization.high",
+            GreaterThan(Utilization(), 0.7),
+            [ActionReference(Log, ["high utilization"])])
+
 def test_boolean():
 
     assert And(True, None).value == False
@@ -148,9 +177,8 @@ def test_comparison():
     assert GreaterThanOrEqual("test", 1).value == False
     assert GreaterThanOrEqual("ab", "a").value == True
 
-def test_caching(temporaryDatabasePaths):
 
-    policyEngine = PolicyEngine()
+def test_caching(policyEngine):
 
     event = policyEngine.policyParser.parseEvent("(test.random.utilization > 1.0) or (test.random.utilization > 1.0)")
     policyEngine.cache.enabled = False
@@ -164,9 +192,7 @@ def test_combination():
     assert GreaterThan(Utilization(), 0.9).value == False
     assert And(GreaterThan(Utilization(), 0.5), LessThanOrEqual(FreeDiskSpace(), 2500)).value == True
 
-def test_parsing(temporaryDatabasePaths):
-
-    policyEngine = PolicyEngine()
+def test_parsing(policyEngine):
 
     assert policyEngine.policyParser.parseEvent("test.healthy").value == True
     assert policyEngine.policyParser.parseEvent("not test.healthy").value == False
@@ -208,9 +234,7 @@ def test_parsing(temporaryDatabasePaths):
     policyEngine.policyParser.parsePolicy("system.healthy: test.healthy -> test.system.log('system healthy')")
     policyEngine.policyParser.parsePolicy("system.healthy: test.healthy -> test.system.log('system healthy'), test.system.alert('system is', test.healthy)")
 
-def test_policyEngine(temporaryDatabasePaths):
-
-    policyEngine = PolicyEngine()
+def test_policyEngine(policyEngine):
 
     numberOfPolicies = len(policyEngine.policies)
     # TODO: add assertable actions
@@ -218,78 +242,129 @@ def test_policyEngine(temporaryDatabasePaths):
     policyEngine.loadPolicy("test.system.healthy: test.healthy -> test.system.log('system healthy')")
     assert len(policyEngine.policies) == numberOfPolicies + 1
     policyEngine.loadPolicy("test.the_same_system.healthy : test.healthy    ->     test.system.log('system healthy')")
-    assert len(policyEngine.policies) == numberOfPolicies + 1
-    policyEngine.loadPolicy("test.system.nothealthy:not test.healthy -> test.system.log('system is not healthy')")
     assert len(policyEngine.policies) == numberOfPolicies + 2
+    policyEngine.loadPolicy("test.system.nothealthy:not test.healthy -> test.system.log('system is not healthy')")
+    assert len(policyEngine.policies) == numberOfPolicies + 3
 
     policyEngine.run()
 
-def test_policyEngineLoading(temporaryDatabasePaths):
-
-    policyEngine = PolicyEngine()
+def test_policyEngineLoading(policyEngine):
     numberOfPolicies = len(policyEngine.policies)
 
-    policy = policyEngine.policyParser.parsePolicy("test.cpu.policy: (cpu.utilization >= 90.0) -> test.system.log('CPU utilization high'),test.system.log('CPU utilization high')")
+    policy = policyEngine.policyParser.parsePolicy("test.diskspace.low: (test.diskspace.free <= 100) -> test.system.log('Disk space is low'),test.system.log('Disk space is low')")
     policyEngine.addPolicy(policy)
 
     policyEngine2 = PolicyEngine()
-    assert "test.cpu.policy" in policyEngine2.policies
+    assert "test.diskspace.low" in policyEngine2.policies
     assert len(policyEngine2.policies) == numberOfPolicies + 1
 
-def test_policyHierarchy(temporaryDatabasePaths):
-    """
-    one
-        one.one
-            one.one.one
-        one.two
-        one.three
-            one.three.one
-            one.three.two
-    two
-        two.one
+class TestPolicyDatabase():
 
-    """
-    class Base(PolicyComponent):
+    def test_addPolicyUsingName(self, backend):
 
-        def __init__(self, name):
-            super(Base, self).__init__(name,
-                                       Healthy(),
-                                       [ActionReference(Log(), [name])])
+        policyDatabase = PolicyDatabase()
 
-    one = Base("one")
-    one_one = Base("one.one")
-    one_one_one = Base("one.one.one")
-    one_two = Base("one.two")
-    one_three = Base("one.three")
-    one_three_one = Base("one.three.one")
-    one_three_two = Base("one.three.two")
-    two = Base("two")
-    two_one = Base("two.one")
+        lowUtilization = LowUtilization()
+        assert policyDatabase.addPolicyUsingName(lowUtilization.id, lowUtilization)
+        # TODO: adjust to True once parent child relations have been implemented
+        assert not policyDatabase.addPolicyUsingName(lowUtilization.id + "/" + lowUtilization.id, LowUtilization())
 
-    one.addPolicy(one_one)
-    one_one.addPolicy(one_one_one)
-    one.addPolicy(one_two)
-    one.addPolicy(one_three)
-    one_three.addPolicy(one_three_one)
-    one_three.addPolicy(one_three_two)
-    two.addPolicy(two_one)
+    def test_addPolicy(self, backend):
 
-    policyEngine = PolicyEngine()
-    policyEngine.addPolicy(one)
-    policyEngine.addPolicy(two)
+        policyDatabase = PolicyDatabase()
 
-#     policyInfos = policyEngine.policyDatabase.getPolicyInfos()
-#     for policyInfo in policyInfos:
-#         log.debug(policyInfo.toJSON(includeClassInfo=True, pretty=True))
-#         log.debug(policyInfo.toJSON(pretty=True))
-    assert policyEngine.policyDatabase.getPolicyInfo("one")
-    assert policyEngine.policyDatabase.getPolicyInfo("one/one.one")
-    assert policyEngine.policyDatabase.getPolicyInfo("one/one.one/one.one.one")
-    assert policyEngine.policyDatabase.getPolicyInfo("one/one.two")
-    assert policyEngine.policyDatabase.getPolicyInfo("one/one.three")
-    assert policyEngine.policyDatabase.getPolicyInfo("one/one.three/one.three.one")
-    assert policyEngine.policyDatabase.getPolicyInfo("one/one.three/one.three.two")
-    assert policyEngine.policyDatabase.getPolicyInfo("two")
-    assert policyEngine.policyDatabase.getPolicyInfo("two/two.one")
+        lowUtilization = LowUtilization()
+        policyDatabase.addPolicy(lowUtilization)
+        assert policyDatabase.policyExists(lowUtilization.id)
 
-    policyEngine.run()
+        highUtilization = HighUtilization()
+        policyDatabase.addPolicy(HighUtilization())
+        assert policyDatabase.policyExists(highUtilization.id)
+
+    def test_clear(self, backend):
+
+        policyDatabase = PolicyDatabase()
+
+        policyDatabase.addPolicy(LowUtilization())
+        policyDatabase.addPolicy(HighUtilization())
+        policyDatabase.clear()
+
+        assert policyDatabase.getNumberOfTopLevelPolicies() == 0
+
+    def test_disablePolicy(self, backend):
+
+        policyDatabase = PolicyDatabase()
+
+        from c4.policyengine import States as PolicyStates
+
+        lowUtilization = LowUtilization()
+        policyDatabase.addPolicy(lowUtilization)
+        policyDatabase.disablePolicy(lowUtilization.id)
+        assert policyDatabase.getPolicyState(lowUtilization.id) == PolicyStates.DISABLED
+
+        highUtilization = HighUtilization()
+        policyDatabase.addPolicy(highUtilization)
+        policyDatabase.disablePolicy(highUtilization.id)
+        assert policyDatabase.getPolicyState(highUtilization.id) == PolicyStates.DISABLED
+
+    def test_enablePolicy(self, backend):
+
+        policyDatabase = PolicyDatabase()
+
+        from c4.policyengine import States as PolicyStates
+
+        lowUtilization = LowUtilization()
+        lowUtilization.state = PolicyStates.DISABLED
+        policyDatabase.addPolicy(lowUtilization)
+        lowUtilization.state = PolicyStates.ENABLED
+        policyDatabase.enablePolicy(lowUtilization.id)
+        assert policyDatabase.getPolicyState(lowUtilization.id) == PolicyStates.ENABLED
+
+        highUtilization = HighUtilization()
+        highUtilization.state = PolicyStates.DISABLED
+        policyDatabase.addPolicy(highUtilization)
+        highUtilization.state = PolicyStates.ENABLED
+        policyDatabase.enablePolicy(highUtilization.id)
+        assert policyDatabase.getPolicyState(highUtilization.id) == PolicyStates.ENABLED
+
+    def test_getNumberOfTopLevelPolicies(self, backend):
+
+        policyDatabase = PolicyDatabase()
+
+        policyDatabase.addPolicy(LowUtilization())
+        policyDatabase.addPolicy(HighUtilization())
+
+        assert policyDatabase.getNumberOfTopLevelPolicies() == 2
+
+    def test_getPolicyInfos(self, backend):
+
+        policyDatabase = PolicyDatabase()
+
+        policyImplementation = LowUtilization()
+        policyDatabase.addPolicy(policyImplementation)
+
+        policyComponent = HighUtilization()
+        policyDatabase.addPolicy(policyComponent)
+
+        assert set(policy.name for policy in policyDatabase.getPolicyInfos()) == set([policyImplementation.id, policyComponent.id])
+
+    def test_getPolicyState(self, backend):
+
+        policyDatabase = PolicyDatabase()
+
+        lowUtilization = LowUtilization()
+        policyDatabase.addPolicy(lowUtilization)
+        from c4.policyengine import States as PolicyStates
+        assert policyDatabase.getPolicyState(lowUtilization.id) == PolicyStates.ENABLED
+
+    def test_policyExists(self, backend):
+
+        policyDatabase = PolicyDatabase()
+
+        lowUtilization = LowUtilization()
+        policyDatabase.addPolicy(lowUtilization)
+        assert policyDatabase.policyExists(lowUtilization.id)
+
+        highUtilization = HighUtilization()
+        policyDatabase.addPolicy(highUtilization)
+        assert policyDatabase.policyExists(highUtilization.id)

@@ -1,7 +1,12 @@
+"""
+Boolean operators
+"""
 from c4.policyengine import BinaryOperator, UnaryOperator
 
 class And(BinaryOperator):
-
+    """
+    `and` operator
+    """
     id = "and"
 
     def evaluateOperation(self, one, two):
@@ -10,7 +15,9 @@ class And(BinaryOperator):
         return False
 
 class Not(UnaryOperator):
-
+    """
+    `not` operator
+    """
     id = "not"
 
     def evaluateOperation(self, one):
@@ -19,7 +26,9 @@ class Not(UnaryOperator):
         return False
 
 class Or(BinaryOperator):
-
+    """
+    `or` operator
+    """
     id = "or"
 
     def evaluateOperation(self, one, two):

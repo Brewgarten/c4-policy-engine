@@ -1,21 +1,27 @@
-import inspect
-import logging
-import traceback
-
+"""
+A policy engine implementation with support for events and actions as well as textual representations
+"""
 from abc import ABCMeta, abstractmethod
 from collections import OrderedDict
 from datetime import datetime
+import inspect
+import logging
+import multiprocessing
+import re
+import time
+import traceback
 
-import c4.utils.util
+import c4.policies
 import c4.policyengine.actions
 import c4.policyengine.events
-import c4.policyengine.policies
-
-from c4.system.db import DBManager
+import c4.policyengine.events.operators
+from c4.system.backend import Backend
 from c4.utils.enum import Enum
 from c4.utils.jsonutil import JSONSerializable
 from c4.utils.logutil import ClassLogger
-from c4.utils.util import callWithVariableArguments, getFullModuleName
+from c4.utils.util import (callWithVariableArguments,
+                           getFormattedArgumentString, getFullModuleName, getModuleClasses)
+
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +56,6 @@ class Event(object):
 
         :returns: value
         """
-        return None
 
     @property
     def value(self):
@@ -76,6 +81,7 @@ class EventReference(Event):
     :param keyValueArguments: key value arguments
     """
     def __init__(self, event, arguments=None, keyValueArguments=None):
+        super(EventReference, self).__init__()
         self.event = event
         self.id = event.id
         if arguments is None:
@@ -113,12 +119,10 @@ class EventReference(Event):
                 else:
                     keyValueArguments[key] = value
 
-            return callWithVariableArguments(
-                  self.event.evaluate, *arguments, **keyValueArguments)
-        except Exception as e:
+            return callWithVariableArguments(self.event.evaluate, *arguments, **keyValueArguments)
+        except Exception as exception:
             self.log.error(self.event)
-            self.log.error(e)
-            self.log.error(traceback.format_exc())
+            self.log.exception(exception)
 
     def __repr__(self, *args, **kwargs):
         return "({0}{1})".format(self.id,
@@ -152,7 +156,6 @@ class Action(object):
 
         :returns: result
         """
-        return None
 
     def __repr__(self, *args, **kwargs):
         return "{0}(...)".format(self.id)
@@ -187,12 +190,10 @@ class ActionReference(Action):
         :returns: result
         """
         try:
-            return callWithVariableArguments(
-                  self.action.perform, *self.arguments, **self.keyValueArguments)
-        except Exception as e:
+            return callWithVariableArguments(self.action.perform, *self.arguments, **self.keyValueArguments)
+        except Exception as exception:
             self.log.error(self.action)
-            self.log.error(e)
-            self.log.error(traceback.format_exc())
+            self.log.exception(exception)
 
     def __repr__(self, *args, **kwargs):
         return "{0}{1}".format(self.id, getFormattedArgumentString(self.arguments, self.keyValueArguments))
@@ -217,7 +218,9 @@ class BinaryOperator(Event):
 
     @abstractmethod
     def evaluateOperation(self, one, two):
-        pass
+        """
+        Evaluate the binary operation with the specified operands
+        """
 
     def evaluate(self):
         one = self.one.evaluate()
@@ -250,6 +253,7 @@ class CachableEvent(Event):
     :type event: :class:`Event`
     """
     def __init__(self, cache, event):
+        super(CachableEvent, self).__init__()
         self.cache = cache
         self.event = event
         self.id = event.id
@@ -290,6 +294,8 @@ class Policy(object):
         """
         Formatted description based on the doc string
         """
+        if not self.__doc__:
+            return ""
         description = []
         for line in self.__doc__.splitlines():
             line = line.strip()
@@ -299,11 +305,17 @@ class Policy(object):
 
     @abstractmethod
     def evaluateEvent(self):
-        pass
+        """
+        Evaluate the event to determine if the action for this policy should
+        to be performed
+        """
 
     @abstractmethod
     def performActions(self):
-        pass
+        """
+        Perform actions specified for the policy if the event evaluated as
+        ``True``
+        """
 
     def __hash__(self, *args, **kwargs):
         return hash(repr(self))
@@ -364,10 +376,10 @@ class PolicyComponent(Policy):
         return hash(repr(self))
 
     def __repr__(self, *args, **kwargs):
-        return "{0} -> {1}".format(repr(self.event), ",".join([str(a) for a in self.actions]))
+        return "{0} -> {1}".format(repr(self.event), ",".join([str(action) for action in self.actions]))
 
     def __str__(self, *args, **kwargs):
-        return "{0}: {1} -> {2}".format(self.id, self.event, ",".join([str(a) for a in self.actions]))
+        return "{0}: {1} -> {2}".format(self.id, self.event, ",".join([str(action) for action in self.actions]))
 
 @ClassLogger
 class PolicyDatabase(object):
@@ -375,8 +387,7 @@ class PolicyDatabase(object):
     An abstraction of the underlying database where policies are stored
     """
     def __init__(self):
-        # FIXME: this needs to use a seperate database from the system manager since this is a separate package
-        self.database = DBManager()
+        self.store = Backend().keyValueStore
 
     def addPolicyUsingName(self, fullPolicyName, policy):
         """
@@ -390,7 +401,7 @@ class PolicyDatabase(object):
         nameHierarchy = fullPolicyName.split("/")
         if len(nameHierarchy) == 1:
             # no parent
-            if self.policyExists(policy):
+            if self.policyExists(policy.id):
                 self.log.error("policy '%s' already exists", repr(policy))
                 return False
             else:
@@ -402,52 +413,51 @@ class PolicyDatabase(object):
                         self.addPolicyUsingName("{0}/{1}".format(fullPolicyName, childPolicy.id), childPolicy)
 
         else:
-            parentPolicyName = "/".join(nameHierarchy[:-1])
-            parentDatabaseId = self.getPolicyDatabaseId(parentPolicyName)
-            if parentDatabaseId:
-                if self.policyExists(policy, parentDatabaseId):
-                    self.log.error("policy '%s' already exists", repr(policy))
-                    return False
-                else:
-                    self.addPolicy(policy, parentDatabaseId)
-
-                    # check if we can add children
-                    if hasattr(policy, "policies"):
-                        for childPolicy in policy.policies.values():
-                            self.addPolicyUsingName("{0}/{1}".format(fullPolicyName, childPolicy.id), childPolicy)
-            else:
-                self.log.error("parent policy '%s' is missing", parentPolicyName)
-                return False
+            self.log.warn("Parent child relationships not implemented yet")
+            return False
 
         return True
 
-    def addPolicy(self, policy, parentDatabaseId=None):
+    def addPolicy(self, policy):
         """
         Add a policy
 
         :param policy: policy
         :type policy: :class:`Policy`
-        :param parentDatabaseId: parent database id
-        :type parentDatabaseId: int
         """
-        propertiesString = None
-        representation = repr(policy)
-        if isinstance(policy, PolicyComponent):
-            # TODO: do we care about policy wrappers or class names of extended policy components?
-            policyType = "{}.{}".format(getFullModuleName(PolicyComponent), PolicyComponent.__name__)
+        policyInfo = self.getPolicyInfo(policy.id)
+        if policyInfo:
+            self.log.error("policy '%s' already exists", policyInfo.name)
+            return None
 
-        else:
-            policyType = "{}.{}".format(getFullModuleName(policy), policy.__class__.__name__)
-            properties = PolicyProperties()
-            properties.description = policy.description
-            propertiesString = properties.toJSON(True)
-        self.database.writeCommit("""
-            insert into t_sm_policies (parent_id, name, representation, hash, state, type, properties)
-            values (?, ?, ?, ?, ?, ?, ?)""",
-            (parentDatabaseId, policy.id, representation, hash(policy),
-             policy.state.name, policyType, propertiesString))
+        properties = {}
         if isinstance(policy, PolicyComponent):
-            self.log.debug("stored policy '%s' '%s'", policy.id, repr(policy))
+            representation = repr(policy)
+            policyType = "{}.{}".format(getFullModuleName(PolicyComponent), PolicyComponent.__name__)
+        else:
+            representation = policy.id
+            policyType = "{}.{}".format(getFullModuleName(policy), policy.__class__.__name__)
+            if policy.description:
+                properties["description"] = policy.description
+
+        policyKey = self.getKey(policy.id)
+        propertiesKey = "{policyKey}/properties".format(policyKey=policyKey)
+        representationKey = "{policyKey}/representation".format(policyKey=policyKey)
+        stateKey = "{policyKey}/state".format(policyKey=policyKey)
+        typeKey = "{policyKey}/type".format(policyKey=policyKey)
+
+        transaction = self.store.transaction
+        transaction.put(policyKey, policy.id)
+        transaction.put(representationKey, representation)
+        transaction.put(stateKey, policy.state.toJSON(includeClassInfo=True))
+        transaction.put(typeKey, policyType)
+        for key, value in properties.items():
+            propertyKey = "{propertiesKey}/{key}".format(propertiesKey=propertiesKey, key=key)
+            transaction.put(propertyKey, value)
+        transaction.commit()
+
+        if isinstance(policy, PolicyComponent):
+            self.log.debug("stored policy '%s' '%s'", policy.id, representation)
         else:
             self.log.debug("stored policy '%s'", policy.id)
 
@@ -455,21 +465,88 @@ class PolicyDatabase(object):
         """
         Remove all policies
         """
-        self.database.writeCommit("delete from t_sm_policies")
+        self.store.deletePrefix("/policies/")
 
-    def disablePolicyById(self, policy_id):
+    def disablePolicy(self, fullPolicyName):
         """
-        Disables the policy in the database given its id
-        """
-        self.log.debug("Disabling policy in database: %s", policy_id)
-        self.database.writeCommit("update t_sm_policies set state = ? where id = ?", (States.DISABLED.name, policy_id))
+        Disables the policy in the database given its name
 
-    def enablePolicyById(self, policy_id):
+        :param fullPolicyName: fully qualified policy name
+        :type fullPolicyName: str
         """
-        Enables the policy in the database given its id
+        stateKey = self.getKey(fullPolicyName, "state")
+        serializedState = self.store.get(stateKey)
+        if not serializedState:
+            self.log.error("could not disable '%s' because it does not exist", fullPolicyName)
+            return
+        self.store.put(stateKey, States.DISABLED.toJSON(includeClassInfo=True))
+
+    def enablePolicy(self, fullPolicyName):
         """
-        self.log.debug("Enabling policy in database: %s", policy_id)
-        self.database.writeCommit("update t_sm_policies set state = ? where id = ?", (States.ENABLED.name, policy_id))
+        Enables the policy in the database given its name
+
+        :param fullPolicyName: fully qualified policy name
+        :type fullPolicyName: str
+        """
+        stateKey = self.getKey(fullPolicyName, "state")
+        serializedState = self.store.get(stateKey)
+        if not serializedState:
+            self.log.error("could not enable '%s' because it does not exist", fullPolicyName)
+            return
+        self.store.put(stateKey, States.ENABLED.toJSON(includeClassInfo=True))
+
+    def getKey(self, fullPolicyName, *additionalParts):
+        """
+        Get key for the specified policy
+
+        :param fullPolicyName: fully qualified policy name
+        :type fullPolicyName: str
+        :returns: key
+        :rtype: str
+        """
+        nameHierarchy = fullPolicyName.split("/")
+        keyParts = [""]
+        for name in nameHierarchy:
+            keyParts.extend(["policies", name])
+        keyParts.extend(additionalParts)
+        return "/".join(keyParts)
+
+    def getNestedPolicyInfos(self, parentKey, policyInfoMapping):
+        """
+        Get policies based on parent key and the already retrieved values
+
+        :param parentKey: parent key
+        :type parentKey: str
+        :param policyInfoMapping: policy information mapping of key-value
+        :type policyInfoMapping: dict
+        """
+        policies = {}
+        policyKeyExpression = re.compile(r"(?P<policyKey>{parentKey}/policies/[^/]+)$".format(parentKey=parentKey))
+        for key in policyInfoMapping.keys():
+            match = policyKeyExpression.match(key)
+            if match:
+                policyKey = match.group("policyKey")
+                propertiesKey = "{policyKey}/properties/".format(policyKey=policyKey)
+                representationKey = "{policyKey}/representation".format(policyKey=policyKey)
+                stateKey = "{policyKey}/state".format(policyKey=policyKey)
+                typeKey = "{policyKey}/type".format(policyKey=policyKey)
+                policyProperties = {
+                    key.replace(propertiesKey, ""): value
+                    for key, value in policyInfoMapping.items()
+                    if key.startswith(propertiesKey)
+                }
+
+                policyInfo = PolicyInfo(
+                    policyInfoMapping[policyKey],
+                    policyInfoMapping[representationKey],
+                    policyInfoMapping[stateKey],
+                    policyInfoMapping[typeKey],
+                    policyProperties
+                )
+
+                policyInfo.policies = self.getNestedPolicyInfos(policyKey, policyInfoMapping)
+                policies[policyInfo.name] = policyInfo
+        return policies
 
     def getNumberOfTopLevelPolicies(self):
         """
@@ -478,38 +555,13 @@ class PolicyDatabase(object):
         :returns: number of top level policies
         :rtype: int
         """
-        rows = self.database.query("""
-            select count()
-            from t_sm_policies
-            where parent_id is null""")
-        return rows[0][0]
-
-    def getPolicyDatabaseId(self, fullPolicyName):
-        """
-        Get database id for the specified policy
-
-        :param fullPolicyName: fully qualified policy name
-        :type fullPolicyName: str
-        :returns: database id
-        :rtype: int
-        """
-        # TODO: convert to recursive query
-        try:
-            nameHierarchy = fullPolicyName.split("/")
-            parentId = None
-            for policyName in nameHierarchy:
-                rows = self.database.query("""
-                    select id
-                    from t_sm_policies
-                    where parent_id is ? and name is ?""",
-                    (parentId, policyName))
-                if not rows:
-                    raise Exception("not found")
-                parentId = rows[0]["id"]
-
-            return rows[0]["id"]
-        except:
-            return None
+        pattern = re.compile("/policies/[^/]+$")
+        policies = {
+            pattern.search(key)
+            for key, _ in self.store.getPrefix("/policies/")
+            if pattern.search(key)
+        }
+        return len(policies)
 
     def getPolicyInfo(self, fullPolicyName):
         """
@@ -520,37 +572,38 @@ class PolicyDatabase(object):
         :returns: policy info
         :rtype: :class:`PolicyInfo`
         """
-        databaseId = self.getPolicyDatabaseId(fullPolicyName)
-        if databaseId:
-            return self.getPolicyInfoByDatabaseId(databaseId)
-        return None
+        policyKey = self.getKey(fullPolicyName)
+        policyName = self.store.get(policyKey)
+        if not policyName:
+            return None
 
-    def getPolicyInfoByDatabaseId(self, databaseId):
-        """
-        Get policy info for the specified policy
+        policyPrefix = policyKey + "/"
+        # map from key to value and deserialize value automatically
+        policyInfoMapping = {
+            key : JSONSerializable.fromJSON(value) if JSONSerializable.classAttribute in value else value
+            for key, value in self.store.getPrefix(policyPrefix)
+        }
 
-        :param databaseId: database id
-        :type databaseId: int
-        :returns: policy info
-        :rtype: :class:`PolicyInfo`
-        """
-        policyInfo = None
-        rows = self.database.query("""
-            with recursive
-                policies(id, level, name, representation, state, type, properties) as (
-                    select id, 0, name, representation, state, type, properties
-                    from t_sm_policies
-                    where id is ?
-                    union all
-                    select t.id, policies.level+1, policies.name || "/" || t.name, t.representation, t.state, t.type, t.properties
-                    from t_sm_policies as t join policies on t.parent_id=policies.id
-                 order by 2 desc
-                )
-            select * from policies;""", (databaseId,))
+        # deal with policy information
+        propertiesKey = "{policyKey}/properties/".format(policyKey=policyKey)
+        representationKey = "{policyKey}/representation".format(policyKey=policyKey)
+        stateKey = "{policyKey}/state".format(policyKey=policyKey)
+        typeKey = "{policyKey}/type".format(policyKey=policyKey)
+        policyProperties = {
+            key.replace(propertiesKey, ""): value
+            for key, value in policyInfoMapping.items()
+            if key.startswith(propertiesKey)
+        }
 
-        policyInfos = self._convertRowsToPolicyInfos(rows)
-        if policyInfos:
-            policyInfo = policyInfos.pop()
+        policyInfo = PolicyInfo(
+            policyName,
+            policyInfoMapping[representationKey],
+            policyInfoMapping[stateKey],
+            policyInfoMapping[typeKey],
+            policyProperties
+        )
+        policyInfo.policies = self.getNestedPolicyInfos(policyKey, policyInfoMapping)
+
         return policyInfo
 
     def getPolicyInfos(self):
@@ -560,73 +613,42 @@ class PolicyDatabase(object):
         :returns: list of policy infos
         :rtype: [:class:`PolicyInfo`]
         """
-        rows = self.database.query("""
-            with recursive
-                policies(id, level, name, representation, state, type, properties) as (
-                    select id, 0, name, representation, state, type, properties
-                    from t_sm_policies
-                    where parent_id is null
-                    union all
-                    select t.id, policies.level+1, policies.name || "/" || t.name, t.representation, t.state, t.type, t.properties
-                    from t_sm_policies as t join policies on t.parent_id=policies.id
-                 order by 2 desc
-                )
-            select * from policies;""")
-        return self._convertRowsToPolicyInfos(rows)
+        policyInfoMapping = {
+            key: JSONSerializable.fromJSON(value) if JSONSerializable.classAttribute in value else value
+            for key, value in self.store.getAll()
+        }
+        return self.getNestedPolicyInfos("", policyInfoMapping).values()
 
-    def policyExists(self, policy, parentDatabaseId=None):
+    def getPolicyState(self, fullPolicyName):
+        """
+        Get the state of 'policy' if it exists
+
+        :param fullPolicyName: fully qualified policy name
+        :type fullPolicyName: str
+        :returns: state of the policy if it exists else None
+        :rtype: :class:`States`
+        """
+        stateKey = self.getKey(fullPolicyName, "state")
+        value = self.store.get(stateKey)
+        if value is None:
+            self.log.error("could not get state because '%s' does not exist", fullPolicyName)
+            return None
+        return JSONSerializable.fromJSON(value)
+
+    def policyExists(self, fullPolicyName):
         """
         Does the specified policy already exist
 
-        :param policy: policy
-        :type policy: :class:`Policy`
-        :param parentDatabaseId: parent database id
-        :type parentDatabaseId: int
+        :param fullPolicyName: fully qualified policy name
+        :type fullPolicyName: str
         :returns: whether policy exists
         :rtype: bool
         """
-        rows = self.database.query("""
-            select name
-            from t_sm_policies
-            where parent_id is ? and hash = ?""",
-            (parentDatabaseId, hash(policy),))
-        if rows:
+        stateKey = self.getKey(fullPolicyName, "state")
+        serializedState = self.store.get(stateKey)
+        if serializedState:
             return True
         return False
-
-    def _convertRowsToPolicyInfos(self, rows):
-        """
-        Convert database rows into policy infos
-
-        :param rows: database rows
-        :type rows: [:class:`~sqlite3.row`]
-        :returns: list of policy infos
-        :rtype: [:class:`PolicyInfo`]
-        """
-        if not rows:
-            return []
-
-        root = PolicyInfo("root", None, None, None, None)
-        for row in rows:
-
-            state = States.valueOf(row["state"])
-            if row["properties"]:
-                properties = PolicyProperties.fromJSON(row["properties"])
-            else:
-                properties = None
-
-            # split fully qualified name into path and name
-            currentPath = row["name"].split("/")
-            name = currentPath.pop()
-            policyInfo = PolicyInfo(name, row["representation"], state, row["type"], properties)
-
-            # traverse path to parent
-            currentPolicyInfo = root
-            for pathElement in currentPath:
-                currentPolicyInfo = currentPolicyInfo.policies[pathElement]
-            currentPolicyInfo.addPolicyInfo(policyInfo)
-
-        return root.policies.values()
 
 @ClassLogger
 class PolicyEngine(object):
@@ -745,14 +767,14 @@ class PolicyEngine(object):
                     policies.append(policy)
                     self.log.debug("loaded policy '%s: %s'", policy.id, repr(policy))
 
-                except Exception as e:
-                    self.log.error("could not load policy '%s': '%s': %s", policyInfo.name, policyInfo.representation, e)
+                except Exception as exception:
+                    self.log.error("could not load policy '%s': '%s': %s", policyInfo.name, policyInfo.representation, exception)
 
             else:
                 try:
                     # get class info
                     info = policyInfo.type.split(".")
-                    className = info.pop()
+                    className = str(info.pop())
                     moduleName = ".".join(info)
 
                     # load class from module
@@ -768,8 +790,8 @@ class PolicyEngine(object):
                     policy.state = policyInfo.state
                     policies.append(policy)
                     self.log.debug("loaded policy '%s' of type '%s'", policyInfo.name, policyInfo.type)
-                except Exception as e:
-                    self.log.error("could not load policy '%s' of type '%s'", policyInfo.name, policyInfo.type, e)
+                except Exception as exception:
+                    self.log.error("could not load policy '%s' of type '%s': %s", policyInfo.name, policyInfo.type, exception)
 
         return policies
 
@@ -778,14 +800,14 @@ class PolicyEngine(object):
         Disables the given policy
         """
         self.log.debug("Disabling policy %s", str(policy))
-        policy_id = self.policyDatabase.getPolicyDatabaseId(policy.id)
-        if policy_id is None:
+        policyInfo = self.policyDatabase.getPolicyInfo(policy.id)
+        if policyInfo is None:
             self.log.error("Unable to get policy from the database: %s", str(policy))
             return
         # disable the policy in memory and in the database
         if policy.state == States.ENABLED:
             policy.state = States.DISABLED
-            self.policyDatabase.disablePolicyById(policy_id)
+            self.policyDatabase.disablePolicy(policy.id)
         else:
             self.log.info("Policy is already disabled %s", str(policy))
 
@@ -794,14 +816,14 @@ class PolicyEngine(object):
         Enables the given policy
         """
         self.log.debug("Enabling policy %s", str(policy))
-        policy_id = self.policyDatabase.getPolicyDatabaseId(policy.id)
-        if policy_id is None:
+        policyInfo = self.policyDatabase.getPolicyInfo(policy.id)
+        if policyInfo is None:
             self.log.error("Unable to get policy from the database: %s", str(policy))
             return
         # enable the policy in memory and in the database
-        if policy.state == States.DISABLED:
+        if not policy.isEnabled():
             policy.state = States.ENABLED
-            self.policyDatabase.enablePolicyById(policy_id)
+            self.policyDatabase.enablePolicy(policy.id)
         else:
             self.log.info("Policy is already enabled %s", str(policy))
 
@@ -809,8 +831,8 @@ class PolicyEngine(object):
         """
         Loads Actions from the c4/system/policies directory.
         """
-        actions = c4.utils.util.getModuleClasses(c4.policyengine.actions, Action)
-        actions.extend(c4.utils.util.getModuleClasses(c4.policyengine.policies, Action))
+        actions = getModuleClasses(c4.policyengine.actions, Action)
+        actions.extend(getModuleClasses(c4.policies, Action))
         # filter out base classes
         actions = [action for action in actions if action != Action and action != ActionReference]
         self.addActions(actions)
@@ -820,18 +842,17 @@ class PolicyEngine(object):
         Loads Policies from the c4/system/policies directory.
         """
         # load policies
-        policies = c4.utils.util.getModuleClasses(c4.policyengine.policies, Policy)
+        policies = getModuleClasses(c4.policies, Policy)
         # filter out base class
         policies = [policy for policy in policies if policy != Policy]
         for policy in policies:
             try:
                 self.log.debug("loading default policy '%s' of type '%s.%s'", policy.id, policy.__module__, policy.__name__)
                 self.addPolicy(policy(self.cache))
-            except Exception as e:
-                self.log.error(e)
-                self.log.error(traceback.format_exc())
+            except Exception as exception:
+                self.log.exception(exception)
 
-        wrappedPolicies = c4.utils.util.getModuleClasses(c4.policyengine.policies, PolicyWrapper)
+        wrappedPolicies = getModuleClasses(c4.policies, PolicyWrapper)
         # remove base class
         if PolicyWrapper in wrappedPolicies:
             wrappedPolicies.remove(PolicyWrapper)
@@ -843,8 +864,8 @@ class PolicyEngine(object):
         """
         Loads Events from the c4/system/policies directory.
         """
-        events = c4.utils.util.getModuleClasses(c4.policyengine.events, Event)
-        events.extend(c4.utils.util.getModuleClasses(c4.policyengine.policies, Event))
+        events = getModuleClasses(c4.policyengine.events, Event)
+        events.extend(getModuleClasses(c4.policies, Event))
         # filter out base classes and operators
         events = [event for event in events if event != Event and not issubclass(event, (UnaryOperator, BinaryOperator))]
         self.addEvents(events)
@@ -868,8 +889,8 @@ class PolicyEngine(object):
         try:
             policy = self.policyParser.parsePolicy(string)
             self.addPolicy(policy)
-        except Exception as e:
-            self.log.error("could not load policy '%s': %s", string, e)
+        except Exception as exception:
+            self.log.error("could not load policy '%s': %s", string, exception)
 
     def run(self, policy=None):
         """
@@ -892,9 +913,8 @@ class PolicyEngine(object):
                         if childPolicy.state == States.ENABLED:
                             try:
                                 self.run(childPolicy)
-                            except Exception as e:
-                                self.log.error(e)
-                                self.log.error(traceback.format_exc())
+                            except Exception as exception:
+                                self.log.exception(exception)
             else:
                 self.log.debug("no event match for '%s'", policy)
             end = datetime.utcnow()
@@ -913,9 +933,8 @@ class PolicyEngine(object):
                 if policy.state == States.ENABLED:
                     try:
                         self.run(policy)
-                    except Exception as e:
-                        self.log.error(e)
-                        self.log.error(traceback.format_exc())
+                    except Exception as exception:
+                        self.log.exception(exception)
                 else:
                     self.log.debug("'%s' disabled", policy.id)
 
@@ -989,13 +1008,15 @@ class PolicyParser(object):
         self.binaryOperators = {}
 
         import pyparsing
-        import c4.policyengine.events.operators
 
         # constant values
         self.stringConstantElement = (pyparsing.QuotedString("\"", unquoteResults=True) |
                                       pyparsing.QuotedString("'", unquoteResults=True))
         self.numberConstantElement = pyparsing.Word(pyparsing.nums + ".")
         def numberConstantElementParseAction(tokens):
+            """
+            Parse number constants into `float` or `int`
+            """
             self.log.debug("found number constant '%s'", tokens[0])
             if "." in tokens[0]:
                 try:
@@ -1015,6 +1036,9 @@ class PolicyParser(object):
         # key-value pair constant
         self.namedConstantElement = pyparsing.Word(pyparsing.alphanums) + "=" + self.constantElement
         def namedConstantParseAction(string, location, tokens):
+            """
+            Parse named constant into a key-value dictionary
+            """
             self.log.debug("found named constant  '%s = %s'", tokens[0], tokens[2])
             return {tokens[0]: tokens[2]}
         self.namedConstantElement.addParseAction(namedConstantParseAction)
@@ -1025,6 +1049,9 @@ class PolicyParser(object):
         self.parameterElement = self.constantElement | self.namedConstantElement | self.eventReferenceElement
         self.parametersElement = self.parameterElement + pyparsing.ZeroOrMore(pyparsing.Suppress(",") + self.parameterElement)
         def parametersParseAction(string, location, tokens):
+            """
+            Parse parameters into arguments and key value arguments tuple
+            """
             arguments = []
             keyValueArguments = {}
             for parameter in tokens:
@@ -1038,14 +1065,17 @@ class PolicyParser(object):
 
         # event references
         self.eventReferenceElement << (
-                                        (pyparsing.Word(pyparsing.alphanums + ".") +
-                                               pyparsing.Suppress("(") +
-                                                   pyparsing.Optional(self.parametersElement) +
-                                               pyparsing.Suppress(")")) |
-                                       pyparsing.Word(pyparsing.alphanums + ".")
-                                       )
+            (
+                pyparsing.Word(pyparsing.alphanums + ".") +
+                pyparsing.Suppress("(") +
+                pyparsing.Optional(self.parametersElement) +
+                pyparsing.Suppress(")")) |
+            pyparsing.Word(pyparsing.alphanums + ".")
+        )
         def eventReferenceElementParseAction(string, location, tokens):
-
+            """
+            Parse event references into a cachable event
+            """
             if len(tokens) == 1:
                 self.log.debug("found event reference '%s'", tokens[0])
                 parameters = ([], {})
@@ -1054,15 +1084,17 @@ class PolicyParser(object):
                 parameters = tokens[1]
 
             if tokens[0] not in self.policyEngine.events:
-                raise pyparsing.ParseFatalException(string, location,
-                        "found unknown event reference '{0}'".format(repr(tokens[0])))
+                raise pyparsing.ParseFatalException(
+                    string, location,
+                    "found unknown event reference '{0}'".format(repr(tokens[0])))
 
             # set up event implementation
             event = self.policyEngine.events[tokens[0]]()
             self.checkParameters(event, "evaluate", parameters[0], parameters[1])
 
-            return CachableEvent(self.policyEngine.cache,
-                                EventReference(event, parameters[0], parameters[1]))
+            return CachableEvent(
+                self.policyEngine.cache,
+                EventReference(event, parameters[0], parameters[1]))
         self.eventReferenceElement.addParseAction(eventReferenceElementParseAction)
 
         # event operators
@@ -1070,20 +1102,25 @@ class PolicyParser(object):
         self.binaryOperatorElement = pyparsing.Or([])
 
         # TODO: outsource to load function?
-        unaryOperatorList = c4.utils.util.getModuleClasses(c4.policyengine.events.operators, UnaryOperator)
+        unaryOperatorList = getModuleClasses(c4.policyengine.events.operators, UnaryOperator)
         for operatorImplementation in unaryOperatorList:
             self.unaryOperators[operatorImplementation.id] = operatorImplementation
             self.unaryOperatorElement.append(pyparsing.Or(operatorImplementation.id))
 
-        binaryOperatorList = c4.utils.util.getModuleClasses(c4.policyengine.events.operators, BinaryOperator)
+        binaryOperatorList = getModuleClasses(c4.policyengine.events.operators, BinaryOperator)
         for operatorImplementation in binaryOperatorList:
             self.binaryOperators[operatorImplementation.id] = operatorImplementation
             self.binaryOperatorElement.append(pyparsing.Or(operatorImplementation.id))
 
         # basic value event with an optional unary operator
-        self.valueEventElement = (pyparsing.Optional(self.unaryOperatorElement) +
-                                    (self.constantElement | self.eventReferenceElement))
+        self.valueEventElement = (
+            pyparsing.Optional(self.unaryOperatorElement) +
+            (self.constantElement | self.eventReferenceElement)
+        )
         def valueEventElementParseAction(string, location, tokens):
+            """
+            Parse value event
+            """
             if len(tokens) == 1:
                 self.log.debug("found event '%s'", repr(tokens[0]))
                 return tokens[0]
@@ -1100,15 +1137,22 @@ class PolicyParser(object):
         # complex event that may consist of a combination of events
         self.eventElement = pyparsing.Forward()
         self.eventElement << (
-                (pyparsing.Optional(self.unaryOperatorElement) + pyparsing.Suppress("(") + self.eventElement + pyparsing.Suppress(")") +
-                        pyparsing.Optional(self.binaryOperatorElement +
-                                pyparsing.Or([
-                                                pyparsing.Optional(self.unaryOperatorElement) + pyparsing.Suppress("(") + self.eventElement + pyparsing.Suppress(")"),
-                                                self.valueEventElement]))) |
-                (self.valueEventElement + self.binaryOperatorElement + self.valueEventElement) |
-                self.valueEventElement
-                  )
+            (
+                pyparsing.Optional(self.unaryOperatorElement) + pyparsing.Suppress("(") + self.eventElement + pyparsing.Suppress(")") +
+                pyparsing.Optional(
+                    self.binaryOperatorElement +
+                    pyparsing.Or([
+                        pyparsing.Optional(self.unaryOperatorElement) + pyparsing.Suppress("(") + self.eventElement + pyparsing.Suppress(")"),
+                        self.valueEventElement])
+                )
+            ) |
+            (self.valueEventElement + self.binaryOperatorElement + self.valueEventElement) |
+            self.valueEventElement
+        )
         def eventElementParseAction(string, location, tokens):
+            """
+            Parse event
+            """
             if len(tokens) == 1:
                 self.log.debug("found event '%s'", repr(tokens[0]))
                 return tokens[0]
@@ -1137,6 +1181,9 @@ class PolicyParser(object):
         self.actionElement = (self.actionIdElement +
                               pyparsing.Suppress("(") + pyparsing.Optional(self.parametersElement) + pyparsing.Suppress(")"))
         def actionElementParseAction(string, location, tokens):
+            """
+            Parse action into an action reference
+            """
             if len(tokens) == 1:
                 self.log.debug("found action '%s'", tokens[0])
                 parameters = ([], {})
@@ -1145,8 +1192,9 @@ class PolicyParser(object):
                 parameters = tokens[1]
 
             if tokens[0] not in self.policyEngine.actions:
-                raise pyparsing.ParseFatalException(string, location,
-                        "found unknown action reference '{0}'".format(tokens[0]))
+                raise pyparsing.ParseFatalException(
+                    string, location,
+                    "found unknown action reference '{0}'".format(tokens[0]))
 
             # set up action implementation
             action = self.policyEngine.actions[tokens[0]]()
@@ -1164,14 +1212,16 @@ class PolicyParser(object):
 
             # make sure we have at least the number of arguments that the action requires
             if len(handlerArguments) != len(arguments):
-                raise pyparsing.ParseFatalException(string, location,
-                        "action '{0}' requires {1} arguments but {2}: {3} are given".format(
-                            action, len(handlerArguments), len(arguments), arguments))
+                raise pyparsing.ParseFatalException(
+                    string, location,
+                    "action '{0}' requires {1} arguments but {2}: {3} are given".format(
+                        action, len(handlerArguments), len(arguments), arguments))
 
             # check for unknown named arguments
             for key in keyValueArguments:
                 if key not in handlerKeyValueArguments:
-                    raise pyparsing.ParseFatalException(string, location,
+                    raise pyparsing.ParseFatalException(
+                        string, location,
                         "action '{0}' does not have a named argument '{1}'".format(action, key))
 
             return ActionReference(self.policyEngine.actions[tokens[0]](), parameters[0], parameters[1])
@@ -1212,7 +1262,7 @@ class PolicyParser(object):
         # make sure we have at least the number of arguments that the object requires
         if len(handlerArguments) != len(arguments) and handlerArgSpec[1] is None:
             raise ValueError("object '{0}' requires {1} arguments but {2}: {3} are given".format(
-                        repr(o), len(handlerArguments), len(arguments), arguments))
+                repr(o), len(handlerArguments), len(arguments), arguments))
 
         # check for unknown named arguments
         for key in keyValueArguments:
@@ -1252,6 +1302,43 @@ class PolicyParser(object):
         policyItems = self.policyElement.parseString(string, parseAll=True)
         return PolicyComponent(policyItems[0], policyItems[1], policyItems[2:])
 
+@ClassLogger
+class PolicyEngineProcess(multiprocessing.Process):
+    """
+    Policy engine process
+
+    :param properties: properties
+    :type properties: dict
+    """
+    def __init__(self, properties=None):
+        super(PolicyEngineProcess, self).__init__(name="Policy engine")
+        self.properties = properties or {}
+        self.initial = self.properties.get("policy.timer.initial", 5)
+        self.repeat = self.properties.get("policy.timer.repeat", -1)
+        self.interval = self.properties.get("policy.timer.interval", 10)
+
+    def run(self):
+        """
+        The implementation of the policy engine process
+        """
+        policyEngine = PolicyEngine()
+        try:
+            time.sleep(self.initial)
+            if self.repeat < 0:
+                while True:
+                    policyEngine.run()
+                    time.sleep(self.interval)
+            else:
+                while self.repeat >= 0:
+                    policyEngine.run()
+                    time.sleep(self.interval)
+                    self.repeat -= 1
+        except KeyboardInterrupt:
+            self.log.debug("Exiting %s", self.name)
+        except:
+            self.log.debug("Forced exiting %s", self.name)
+            self.log.error(traceback.format_exc())
+
 class PolicyProperties(JSONSerializable):
     """
     Policy properties
@@ -1286,7 +1373,9 @@ class UnaryOperator(Event):
 
     @abstractmethod
     def evaluateOperation(self, one):
-        pass
+        """
+        Evaluate the unary operation with the specified operands
+        """
 
     def evaluate(self):
         one = self.one.evaluate()
@@ -1341,43 +1430,3 @@ class ValueEvent(Event):
 
     def __str__(self, *args, **kwargs):
         return str(self.evaluate())
-
-def getFormattedArgumentString(arguments, keyValueArguments):
-    """
-    Get a formatted version of the argument string such that it can be used
-    in representations.
-
-    E.g., action("test", key="value") instead of action(["test"],{"key"="value"}
-
-    :param arguments: arguments
-    :type arguments: []
-    :param keyValueArguments: key value arguments
-    :type keyValueArguments: dict
-    :returns: formatted argument string
-    :rtype: str
-    """
-    argumentString = ""
-    if arguments:
-        argumentList = []
-        for argument in arguments:
-            if isinstance(argument, (str, unicode)):
-                argumentList.append("'{0}'".format(argument))
-            else:
-                argumentList.append(str(argument))
-        argumentString += ",".join(argumentList)
-
-    if keyValueArguments:
-        if arguments:
-            argumentString += ","
-        keyValueArgumentList = []
-        for key, value in keyValueArguments.items():
-            if isinstance(value, (str, unicode)):
-                keyValueArgumentList.append("{0}='{1}'".format(key, value))
-            else:
-                keyValueArgumentList.append("{0}={1}".format(key, str(value)))
-        argumentString += ",".join(keyValueArgumentList)
-
-    if argumentString:
-        argumentString = "({0})".format(argumentString)
-
-    return argumentString
