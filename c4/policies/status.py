@@ -13,6 +13,7 @@ Functionality
 """
 import datetime
 import logging
+import socket
 
 from c4.messaging import RouterClient
 from c4.policyengine import Action, Event, Policy
@@ -69,7 +70,8 @@ class RequestStatus(Action):
         :param fullDeviceName: fully qualified device manager name
         :type fullDeviceName: device
         """
-        client = RouterClient("localhost")
+        address = socket.gethostname().split(".")[0]
+        client = RouterClient(address)
 
         # FIXME: need to convert fullDeviceName . to / for routing
         if fullDeviceName:
