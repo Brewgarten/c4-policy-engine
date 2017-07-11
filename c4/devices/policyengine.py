@@ -4,7 +4,8 @@ Policy engine device manager
 import logging
 
 from c4.policyengine import PolicyEngineProcess
-from c4.system.deviceManager import (DeviceManagerImplementation, DeviceManagerStatus,
+from c4.system.deviceManager import (DeviceManagerImplementation, 
+                                     DeviceManagerStatus,
                                      operation)
 from c4.utils.logutil import ClassLogger
 
@@ -48,7 +49,7 @@ class PolicyEngineManager(DeviceManagerImplementation):
         """
         The handler for an incoming Status message.
         """
-        return PolicyEngineStatus(self.state)
+        return PolicyEngineStatus(self.state, self.properties)
 
     @operation
     def start(self):
@@ -77,7 +78,10 @@ class PolicyEngineStatus(DeviceManagerStatus):
 
     :param state: state
     :type state: :class:`~c4.system.configuration.States`
+    :param properties: properties
+    :type properties: dict
     """
-    def __init__(self, state):
+    def __init__(self, state, properties):
         super(PolicyEngineStatus, self).__init__()
         self.state = state
+        self.properties = properties

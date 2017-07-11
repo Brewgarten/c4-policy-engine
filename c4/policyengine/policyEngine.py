@@ -402,7 +402,8 @@ class PolicyDatabase(object):
         if len(nameHierarchy) == 1:
             # no parent
             if self.policyExists(policy.id):
-                self.log.error("policy '%s' already exists", repr(policy))
+                # with the ability to run policy engine on multiple nodes but with shared database this is acceptable
+                self.log.debug("policy '%s' already exists", repr(policy))
                 return False
             else:
                 self.addPolicy(policy)
@@ -655,8 +656,11 @@ class PolicyEngine(object):
     """
     Policy engine that allows iterating over policies and performing their actions
     based on whether the specified event matches
+
+    :param properties: properties
+    :type properties: dict
     """
-    def __init__(self):
+    def __init__(self, properties=None):
         self.events = {}
         self.cache = Cache()
         self.cache.enabled = False
@@ -664,14 +668,13 @@ class PolicyEngine(object):
         self.policyParser = PolicyParser(self)
         self.policies = OrderedDict()
         self.policyDatabase = PolicyDatabase()
+        self.properties = properties or {}
 
         self.loadActions()
         self.loadEvents()
-
-        if self.policyDatabase.getNumberOfTopLevelPolicies() > 0:
-            self.loadPoliciesFromDatabase()
-        else:
-            self.loadDefaultPolicies()
+        orderedList = self.properties.get("policies", [] )
+        includePoliciesFromDatabase = self.properties.get("include.policies.database", False)
+        self.loadDefaultPolicies(orderedList=orderedList, includePoliciesFromDatabase=includePoliciesFromDatabase)
 
     def addAction(self, action):
         """
@@ -727,6 +730,8 @@ class PolicyEngine(object):
         """
         if self.policyDatabase.addPolicyUsingName(policy.id, policy):
             self.policies[policy.id] = policy
+        elif policy.id not in self.policies:
+            self.policies[policy.id] = policy            
 
     def addPolicies(self, policies):
         """
@@ -837,28 +842,82 @@ class PolicyEngine(object):
         actions = [action for action in actions if action != Action and action != ActionReference]
         self.addActions(actions)
 
-    def loadDefaultPolicies(self):
+    def loadDefaultPolicies(self, orderedList=None, includePoliciesFromDatabase=False):
         """
         Loads Policies from the c4/system/policies directory.
+
+        :param orderedList: List of policy ids to include
+        :type orderedList: list
+        :param includePoliciesFromDatabase: Include policies form database?
+        :type includePoliciesFromDatabase: boolean
         """
+        # short circuit for empty list
+        if not orderedList:
+            self.log.info("Configuration did not specify any policies to load" )
+            return
+        
         # load policies
         policies = getModuleClasses(c4.policies, Policy)
         # filter out base class
         policies = [policy for policy in policies if policy != Policy]
+        
+        # build temporary unordered dict 
+        policyDict = {}
         for policy in policies:
-            try:
-                self.log.debug("loading default policy '%s' of type '%s.%s'", policy.id, policy.__module__, policy.__name__)
-                self.addPolicy(policy(self.cache))
-            except Exception as exception:
-                self.log.exception(exception)
-
+            policyDict[policy.id] = policy
+        
+        wrappedPolicyDict = {}
         wrappedPolicies = getModuleClasses(c4.policies, PolicyWrapper)
         # remove base class
         if PolicyWrapper in wrappedPolicies:
             wrappedPolicies.remove(PolicyWrapper)
         for wrappedPolicy in wrappedPolicies:
-            self.log.debug("loading default policy '%s' '%s'", wrappedPolicy.id, wrappedPolicy.policy)
-            self.loadPolicy(wrappedPolicy.id + ":" + wrappedPolicy.policy)
+            policyString = wrappedPolicy.id + ":" + wrappedPolicy.policy
+            try:
+                policy = self.policyParser.parsePolicy(policyString)
+                wrappedPolicyDict[policy.id] = policy
+            except Exception as exception:
+                self.log.exception("could not parse policy wrapper '%s': %s", policyString, exception)
+
+        dbPolicyDict = {}
+        if includePoliciesFromDatabase:
+            dbPolicies = self.getPoliciesFromDatabase()
+            for policy in dbPolicies:
+                dbPolicyDict[policy.id] = policy
+                            
+        self.policies.clear()
+        # We are specifying an order for loading the policies, but we have 3 sources the policies could be loaded from,
+        # and the different sources have slightly different behaviors so go through the list to see if the policy can
+        # be found and then load it based on the source; ie class properties will be type 1, policy wrapper will be type 2,
+        # and policies that were custom added will be loaded from the database as type 3
+        
+        # Note that because we are not loading all policies anymore, it isn't sufficient to just check to see if the policy
+        # database has policies loaded; also because we support dynamic loading it isn't sufficient to always load defaults
+        for policyId in orderedList:
+            try:
+                policy = policyDict.get(policyId, None)
+                policyType = 1
+                if not policy:
+                    policy = wrappedPolicyDict.get(policyId, None)
+                    policyType = 2
+                    if not policy:
+                        policy = dbPolicyDict.get(policyId, None)
+                        policyType = 3
+                    
+                if policy:
+                    if policyType == 1:
+                        self.log.debug("loading default policy '%s' of type '%s.%s'", policy.id, policy.__module__, policy.__name__)
+                        self.addPolicy(policy(self.cache))
+                    elif policyType == 2:
+                        self.log.debug("loading default policy '%s' from wrapper", policy.id)
+                        self.addPolicy(policy)
+                    else:
+                        self.log.debug("loading default policy '%s' from database", policy.id)
+                        self.addPolicy(policy)
+                else:
+                    self.log.error("Configuration error - policy: '%s' not found", id )
+            except Exception as exception:
+                self.log.exception(exception)                
 
     def loadEvents(self):
         """
@@ -870,14 +929,14 @@ class PolicyEngine(object):
         events = [event for event in events if event != Event and not issubclass(event, (UnaryOperator, BinaryOperator))]
         self.addEvents(events)
 
-    def loadPoliciesFromDatabase(self):
+    def getPoliciesFromDatabase(self):
         """
-        Load policies from the policy database table
+        Get policies from the policy database table
+
+        :returns: policies
+        :rtype: [:class:`Policy`]
         """
-        policies = self.convertToPolicies(self.policyDatabase.getPolicyInfos())
-        self.policies.clear()
-        for policy in policies:
-            self.policies[policy.id] = policy
+        return self.convertToPolicies(self.policyDatabase.getPolicyInfos())
 
     def loadPolicy(self, string):
         """
@@ -950,7 +1009,7 @@ class PolicyEngine(object):
         TODO: documentation
         """
         # this value might require tweaking for complex policies and multinode systems
-        policyPerfomanceWarn = 2
+        policyPerfomanceWarn = self.properties.get("performance.warning.threshold", 2)
         execTime = (end-start).total_seconds()
         if execTime > policyPerfomanceWarn:
             self.log.warning("Executing policy '%s' has taken: %s seconds", policyName, execTime)
@@ -1321,7 +1380,10 @@ class PolicyEngineProcess(multiprocessing.Process):
         """
         The implementation of the policy engine process
         """
-        policyEngine = PolicyEngine()
+        policyEngine = PolicyEngine(properties=self.properties)
+        policies = policyEngine.policies
+        self.log.info("policies:")
+        self.log.info(policies)
         try:
             time.sleep(self.initial)
             if self.repeat < 0:

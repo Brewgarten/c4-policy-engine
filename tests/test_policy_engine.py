@@ -48,8 +48,17 @@ def policyEngine(backend):
     configuration = backend.configuration
     configuration.addNode(NodeInfo("node1", "tcp://1.2.3.4:5000", role=Roles.ACTIVE))
     configuration.addAlias("system-manager", "node1")
+    properties = {
+        "policy.timer.initial": 5,
+        "policy.timer.interval": 10,
+        "policies": [ 
+            "device.status.refresh",
+            "node.status.refresh"
+        ],
+        "performance.warning.threshold": 2
+    }
 
-    return PolicyEngine()
+    return PolicyEngine(properties=properties)
 
 class Alert(Action):
 
@@ -249,14 +258,45 @@ def test_policyEngine(policyEngine):
     policyEngine.run()
 
 def test_policyEngineLoading(policyEngine):
+    import json
     numberOfPolicies = len(policyEngine.policies)
+    assert numberOfPolicies > 0
 
     policy = policyEngine.policyParser.parsePolicy("test.diskspace.low: (test.diskspace.free <= 100) -> test.system.log('Disk space is low'),test.system.log('Disk space is low')")
+    assert policy.id == "test.diskspace.low"
     policyEngine.addPolicy(policy)
+    propertiesString = """{
+    "policy.timer.initial": 5,
+    "policy.timer.interval": 10,
+    "include.policies.database": true,
+    "policies": [ 
+        "device.status.refresh",
+        "node.status.refresh",
+        "test.diskspace.low"
+    ],
+    "performance.warning.threshold": 2
+}"""
+    properties = json.loads(propertiesString)
 
-    policyEngine2 = PolicyEngine()
+    policyEngine2 = PolicyEngine(properties=properties)
     assert "test.diskspace.low" in policyEngine2.policies
     assert len(policyEngine2.policies) == numberOfPolicies + 1
+
+    properties = {
+        "policy.timer.initial": 5,
+        "policy.timer.interval": 10,
+        "include.policies.database": False,
+        "policies": [ 
+            "device.status.refresh",
+            "node.status.refresh",
+            "test.diskspace.low"
+        ],
+        "performance.warning.threshold": 2
+    }
+
+    policyEngine3 = PolicyEngine(properties=properties)
+    assert "test.diskspace.low" not in policyEngine3.policies
+    assert len(policyEngine3.policies) == numberOfPolicies
 
 class TestPolicyDatabase():
 
