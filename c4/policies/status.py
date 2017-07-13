@@ -117,7 +117,10 @@ class DeviceManagerStatusRefreshPolicy(Policy):
 
                 self.requestDeviceMap[node] = set()
 
-                for fullDeviceName, deviceInfo in nodeInfo.devices.items():
+                for fullDeviceName, deviceInfo in nodeInfo.devices.items():                    
+                    # Skip status if device is in maintenance or is not deployed
+                    if deviceInfo.state == States.MAINTENANCE or deviceInfo.state == States.UNDEPLOYED:
+                        continue
 
                     age = statusAgeInSeconds.evaluate(node, fullDeviceName)
                     # note that all the intervals are specified in seconds
@@ -177,6 +180,10 @@ class SystemManagerStatusRefreshPolicy(Policy):
         for node in configuration.getNodeNames():
 
             nodeInfo = configuration.getNode(node, includeDevices=False)
+            
+            # Skip status if node is disabled
+            if nodeInfo.role == Roles.DISABLED:
+                continue
 
             if nodeInfo.state == States.RUNNING:
 
