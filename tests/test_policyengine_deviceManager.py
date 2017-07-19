@@ -23,7 +23,7 @@ class TestPolicyEngineManager(object):
     def test_getOperations(self):
 
         operations = PolicyEngineManager.getOperations()
-        assert {"start", "stop"} == set(operations.keys())
+        assert {"setPolicies", "start", "stop"} == set(operations.keys())
 
     def test_status(self, systemManagerClusterInfo):
 

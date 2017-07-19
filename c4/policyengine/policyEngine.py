@@ -8,14 +8,18 @@ import inspect
 import logging
 import multiprocessing
 import re
+import socket
 import time
 import traceback
 
+from c4.messaging import RouterClient
 import c4.policies
 import c4.policyengine.actions
 import c4.policyengine.events
 import c4.policyengine.events.operators
 from c4.system.backend import Backend
+from c4.system.configuration import Roles
+from c4.system.messages import Operation
 from c4.utils.enum import Enum
 from c4.utils.jsonutil import JSONSerializable
 from c4.utils.logutil import ClassLogger
@@ -1004,6 +1008,67 @@ class PolicyEngine(object):
             end = datetime.utcnow()
             self.log.debug("executing policy engine took %s", end-start)
 
+    def updateFromDatabase(self):
+        """
+        Update all policies from database (includes list and state).
+        """
+        start = datetime.utcnow()
+        # check policy list to see if it needs updating
+        node = self.properties.get('node', None)
+        name = self.properties.get('name', None)
+        expectedPolicies = None
+        role = None
+        if node and name:
+            configuration = Backend().configuration
+            role = configuration.getRole(node)
+            if role != Roles.DISABLED:   
+                roleInfo = configuration.getRoleInfo(role=role)
+                if roleInfo:
+                    deviceInfo = roleInfo.devices.get(name, None)
+                    if deviceInfo:
+                        properties = deviceInfo.properties
+                        if properties:
+                            expectedPolicies = properties.get('policies', [])
+            else:
+                self.log.info("Node is disabled removing policies...")
+                expectedPolicies = []
+        
+        if expectedPolicies or (role and role == Roles.DISABLED):
+            replacePolicies = False
+            # check for extra policies
+            for policy in self.policies.keys():
+                if policy not in expectedPolicies:
+                    replacePolicies = True
+                    break
+            if not replacePolicies:
+                # check for missing policies
+                for policy in expectedPolicies:
+                    if policy not in self.policies.keys():
+                        replacePolicies = True
+                        break
+            # if mismatch then replace all policies (since order matters)
+            if replacePolicies:
+                self.log.info("Expected policies: %s", str(expectedPolicies))
+                self.log.info("Actual policies: %s", str(self.policies.keys()))
+                self.log.info("Correcting policies...")
+                includePoliciesFromDatabase = self.properties.get("include.policies.database", False)
+                self.loadDefaultPolicies(orderedList=expectedPolicies, includePoliciesFromDatabase=includePoliciesFromDatabase)
+                #TODO send device name a setPolicies operation message to update it's status for reporting
+                address = socket.gethostname().split(".")[0]
+                client = RouterClient(address)
+                client.forwardMessage(Operation("{0}/{1}".format(node, name),
+                                                "setPolicies",
+                                                policies=expectedPolicies))
+        # go through policies in order to update states
+        for key, policy in self.policies.items():
+            dbState = self.policyDatabase.getPolicyState(policy.id)
+            if policy.state != dbState:
+                policy.state = dbState
+                self.policies[key] = policy 
+
+        end = datetime.utcnow()
+        self.log.debug("updating policy engine took %s", end-start)
+
     def checkPerformanceIssues(self, policyName, start, end):
         """
         TODO: documentation
@@ -1375,6 +1440,7 @@ class PolicyEngineProcess(multiprocessing.Process):
         self.initial = self.properties.get("policy.timer.initial", 5)
         self.repeat = self.properties.get("policy.timer.repeat", -1)
         self.interval = self.properties.get("policy.timer.interval", 10)
+        self.updateEnabled = self.properties.get("update.from.db", False)
 
     def run(self):
         """
@@ -1382,12 +1448,13 @@ class PolicyEngineProcess(multiprocessing.Process):
         """
         policyEngine = PolicyEngine(properties=self.properties)
         policies = policyEngine.policies
-        self.log.info("policies:")
-        self.log.info(policies)
+        self.log.info("policies: %s", str(policies))
         try:
             time.sleep(self.initial)
             if self.repeat < 0:
                 while True:
+                    if self.updateEnabled:
+                        policyEngine.updateFromDatabase()
                     policyEngine.run()
                     time.sleep(self.interval)
             else:

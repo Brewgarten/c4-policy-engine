@@ -20,6 +20,10 @@ class PolicyEngineManager(DeviceManagerImplementation):
     def __init__(self, clusterInfo, name, properties=None):
         super(PolicyEngineManager, self).__init__(clusterInfo, name, properties=properties)
         self.policyEngineProcess = None
+        if not properties:
+            self.properties = {}
+        self.properties['node'] = self.node
+        self.properties['name'] = name
 
     def handleLocalStartDeviceManager(self, message, envelope):
         """
@@ -51,6 +55,11 @@ class PolicyEngineManager(DeviceManagerImplementation):
         """
         return PolicyEngineStatus(self.state, self.properties)
 
+    @operation
+    def setPolicies(self, policies):
+        if policies:
+            self.properties['policies'] = policies
+            
     @operation
     def start(self):
         """
@@ -84,4 +93,5 @@ class PolicyEngineStatus(DeviceManagerStatus):
     def __init__(self, state, properties):
         super(PolicyEngineStatus, self).__init__()
         self.state = state
-        self.properties = properties
+        if properties and "policies" in properties:
+            self.policies = properties['policies']
