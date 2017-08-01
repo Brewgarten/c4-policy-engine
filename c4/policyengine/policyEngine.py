@@ -18,7 +18,7 @@ import c4.policyengine.actions
 import c4.policyengine.events
 import c4.policyengine.events.operators
 from c4.system.backend import Backend
-from c4.system.configuration import Roles
+from c4.system.configuration import (States as ConfigStates, Roles)
 from c4.system.messages import Operation
 from c4.utils.enum import Enum
 from c4.utils.jsonutil import JSONSerializable
@@ -1032,6 +1032,7 @@ class PolicyEngine(object):
             else:
                 self.log.info("Node is disabled removing policies...")
                 expectedPolicies = []
+                self.policies.clear()
         
         if expectedPolicies or (role and role == Roles.DISABLED):
             replacePolicies = False
@@ -1450,6 +1451,21 @@ class PolicyEngineProcess(multiprocessing.Process):
         policies = policyEngine.policies
         self.log.info("policies: %s", str(policies))
         try:
+            # wait until device manager transitions to running before starting
+            node = self.properties.get('node', None)
+            name = self.properties.get('name', None)
+            configuration = Backend().configuration
+            state = configuration.getState(node, name)
+            if not state or not isinstance(state, ConfigStates):
+                state = ConfigStates.STARTING
+            self.log.info(state)
+            while state != ConfigStates.RUNNING:
+                self.log.info("Waiting to become running, currently: %s", state.name)
+                time.sleep(self.interval)
+                state = configuration.getState(node, name)
+                if not state or not isinstance(state, ConfigStates):
+                    state = ConfigStates.STARTING
+                        
             time.sleep(self.initial)
             if self.repeat < 0:
                 while True:
