@@ -919,7 +919,7 @@ class PolicyEngine(object):
                         self.log.debug("loading default policy '%s' from database", policy.id)
                         self.addPolicy(policy)
                 else:
-                    self.log.error("Configuration error - policy: '%s' not found", id )
+                    self.log.error("Configuration error - policy: '%s' not found", policyId )
             except Exception as exception:
                 self.log.exception(exception)                
 
