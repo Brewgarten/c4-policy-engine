@@ -620,7 +620,7 @@ class PolicyDatabase(object):
         """
         policyInfoMapping = {
             key: JSONSerializable.fromJSON(value) if JSONSerializable.classAttribute in value else value
-            for key, value in self.store.getAll()
+            for key, value in self.store.getPrefix("/policies")
         }
         return self.getNestedPolicyInfos("", policyInfoMapping).values()
 
@@ -735,7 +735,7 @@ class PolicyEngine(object):
         if self.policyDatabase.addPolicyUsingName(policy.id, policy):
             self.policies[policy.id] = policy
         elif policy.id not in self.policies:
-            self.policies[policy.id] = policy            
+            self.policies[policy.id] = policy
 
     def addPolicies(self, policies):
         """
@@ -859,17 +859,17 @@ class PolicyEngine(object):
         if not orderedList:
             self.log.info("Configuration did not specify any policies to load" )
             return
-        
+
         # load policies
         policies = getModuleClasses(c4.policies, Policy)
         # filter out base class
         policies = [policy for policy in policies if policy != Policy]
-        
-        # build temporary unordered dict 
+
+        # build temporary unordered dict
         policyDict = {}
         for policy in policies:
             policyDict[policy.id] = policy
-        
+
         wrappedPolicyDict = {}
         wrappedPolicies = getModuleClasses(c4.policies, PolicyWrapper)
         # remove base class
@@ -888,13 +888,13 @@ class PolicyEngine(object):
             dbPolicies = self.getPoliciesFromDatabase()
             for policy in dbPolicies:
                 dbPolicyDict[policy.id] = policy
-                            
+
         self.policies.clear()
         # We are specifying an order for loading the policies, but we have 3 sources the policies could be loaded from,
         # and the different sources have slightly different behaviors so go through the list to see if the policy can
         # be found and then load it based on the source; ie class properties will be type 1, policy wrapper will be type 2,
         # and policies that were custom added will be loaded from the database as type 3
-        
+
         # Note that because we are not loading all policies anymore, it isn't sufficient to just check to see if the policy
         # database has policies loaded; also because we support dynamic loading it isn't sufficient to always load defaults
         for policyId in orderedList:
@@ -907,7 +907,7 @@ class PolicyEngine(object):
                     if not policy:
                         policy = dbPolicyDict.get(policyId, None)
                         policyType = 3
-                    
+
                 if policy:
                     if policyType == 1:
                         self.log.debug("loading default policy '%s' of type '%s.%s'", policy.id, policy.__module__, policy.__name__)
@@ -921,7 +921,7 @@ class PolicyEngine(object):
                 else:
                     self.log.error("Configuration error - policy: '%s' not found", policyId )
             except Exception as exception:
-                self.log.exception(exception)                
+                self.log.exception(exception)
 
     def loadEvents(self):
         """
@@ -1021,7 +1021,7 @@ class PolicyEngine(object):
         if node and name:
             configuration = Backend().configuration
             role = configuration.getRole(node)
-            if role != Roles.DISABLED:   
+            if role != Roles.DISABLED:
                 roleInfo = configuration.getRoleInfo(role=role)
                 if roleInfo:
                     deviceInfo = roleInfo.devices.get(name, None)
@@ -1033,7 +1033,7 @@ class PolicyEngine(object):
                 self.log.info("Node is disabled removing policies...")
                 expectedPolicies = []
                 self.policies.clear()
-        
+
         if expectedPolicies or (role and role == Roles.DISABLED):
             replacePolicies = False
             # check for extra policies
@@ -1065,7 +1065,7 @@ class PolicyEngine(object):
             dbState = self.policyDatabase.getPolicyState(policy.id)
             if policy.state != dbState:
                 policy.state = dbState
-                self.policies[key] = policy 
+                self.policies[key] = policy
 
         end = datetime.utcnow()
         self.log.debug("updating policy engine took %s", end-start)
@@ -1465,7 +1465,7 @@ class PolicyEngineProcess(multiprocessing.Process):
                 state = configuration.getState(node, name)
                 if not state or not isinstance(state, ConfigStates):
                     state = ConfigStates.STARTING
-                        
+
             time.sleep(self.initial)
             if self.repeat < 0:
                 while True:
