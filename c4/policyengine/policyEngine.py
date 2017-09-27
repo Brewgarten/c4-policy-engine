@@ -1451,20 +1451,13 @@ class PolicyEngineProcess(multiprocessing.Process):
         policies = policyEngine.policies
         self.log.info("policies: %s", str(policies))
         try:
-            # wait until device manager transitions to running before starting
+            # wait until device managers transition to running before starting
             node = self.properties.get('node', None)
-            name = self.properties.get('name', None)
-            configuration = Backend().configuration
-            state = configuration.getState(node, name)
-            if not state or not isinstance(state, ConfigStates):
-                state = ConfigStates.STARTING
-            self.log.info(state)
-            while state != ConfigStates.RUNNING:
-                self.log.info("Waiting to become running, currently: %s", state.name)
+            devicesNotRunning = self.getDevicesNotRunning(node)
+            while len(devicesNotRunning) > 0:
+                self.log.info("Waiting for devices to become running: %s", ", ".join(devicesNotRunning))
                 time.sleep(self.interval)
-                state = configuration.getState(node, name)
-                if not state or not isinstance(state, ConfigStates):
-                    state = ConfigStates.STARTING
+                devicesNotRunning = self.getDevicesNotRunning(node)
 
             time.sleep(self.initial)
             if self.repeat < 0:
@@ -1483,6 +1476,20 @@ class PolicyEngineProcess(multiprocessing.Process):
         except:
             self.log.debug("Forced exiting %s", self.name)
             self.log.error(traceback.format_exc())
+
+    def getDevicesNotRunning(self, node):
+        """
+        Build a list of devices on this node that are not in running state.
+        :param node: node to get devices for
+        :type node: str
+        :returns: list of device names
+        """
+        devices = Backend().configuration.getDevices(node, flatDeviceHierarchy=True)
+        devicesNotRunning = []
+        for deviceInfo in devices.values():
+            if deviceInfo.state != ConfigStates.RUNNING:
+                devicesNotRunning.append(deviceInfo.name)
+        return devicesNotRunning
 
 class PolicyProperties(JSONSerializable):
     """
